@@ -8,13 +8,17 @@
 
 import argparse
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
+import warnings as pywarnings
 from collections import Counter
 from pathlib import Path
 
 from music21 import converter, stream
+from music21.musicxml.xmlToM21 import MusicXMLWarning
 
 from annotate import annotate
 from overlay import overlay
@@ -24,6 +28,10 @@ from render import render, title_from_filename
 
 AUDIVERIS = "/Applications/Audiveris.app/Contents/MacOS/Audiveris"
 MUSICXML_SUFFIXES = (".mxl", ".musicxml", ".xml")
+
+# music21 complains about OMR quirks it skips (e.g. "Could not import pedal");
+# they say nothing about the names, so keep the output readable
+pywarnings.filterwarnings("ignore", category=MusicXMLWarning)
 
 
 def base_name(path):
@@ -66,13 +74,11 @@ def audiveris_warnings(log_path):
 
 def print_summary(score):
     """Prints notes per measure and clef changes. Returns (warnings, doubtful):
-    warning texts, and the (measure_index, hand) pairs to highlight in the
+    warning texts, and the (measure number, hand) pairs to highlight in the
     PDF: only where a name may be missing or wrong. A short measure (often
     just a lost rest) or a fermata changes no name: terminal only."""
     hand_parts = hands(score)
     hand_of = {label: i for i, (label, _) in enumerate(hand_parts)}
-    index_of = [{m.number: i for i, m in enumerate(part.getElementsByClass(stream.Measure))}
-                for _, part in hand_parts]
     counts = {}
     print("\nNotas detectadas por compás:")
     for label, part in hand_parts:
@@ -93,8 +99,7 @@ def print_summary(score):
     def warn(text, label=None, number=None, mark=False):
         warnings.append(text)
         if mark:
-            hand = hand_of[label]
-            doubtful.append((index_of[hand][number], hand))
+            doubtful.append((number, hand_of[label]))
 
     if len(set(counts.values())) > 1:
         warn(f"Las manos no tienen la misma cantidad de compases: {counts}")
@@ -120,6 +125,8 @@ def main():
     ap.add_argument("--rerender", action="store_true",
                     help="redibujar la partitura con MuseScore en vez de escribir sobre el PDF original")
     ap.add_argument("--out-dir", help="carpeta de salida (por defecto, la del archivo de entrada)")
+    ap.add_argument("--keep", action="store_true",
+                    help="conservar los archivos de trabajo (MusicXML, .omr, logs) junto al PDF")
     args = ap.parse_args()
 
     src = Path(args.input).resolve()
@@ -129,12 +136,22 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
     base = base_name(src)
     out_pdf = out_dir / f"{base}.solfeo.pdf"
+    # intermediate files (Audiveris output, logs, annotated MusicXML) go to a
+    # temporary folder that is removed at the end, unless --keep
+    work_dir = out_dir if args.keep else Path(tempfile.mkdtemp(prefix="solfeo-pdf-"))
+    try:
+        return run(args, src, work_dir, base, out_pdf)
+    finally:
+        if not args.keep:
+            shutil.rmtree(work_dir, ignore_errors=True)
 
+
+def run(args, src, work_dir, base, out_pdf):
     omr_log = None
     rerender = args.rerender
     if src.suffix.lower() == ".pdf":
         print(f"1/2 OMR con Audiveris: {src.name} ...")
-        musicxml, omr_log = run_omr(src, out_dir)
+        musicxml, omr_log = run_omr(src, work_dir)
         omr_project = musicxml.with_suffix(".omr")
     elif src.suffix.lower() in MUSICXML_SUFFIXES:
         print(f"1/2 OMR salteado: la entrada ya es MusicXML ({src.name}); se redibuja con MuseScore")
@@ -148,7 +165,7 @@ def main():
     if rerender:
         print("\n2/2 Anotando y redibujando con MuseScore ...")
         annotate(score, args.octave)
-        annotated = out_dir / f"{base}.solfeo.musicxml"
+        annotated = work_dir / f"{base}.solfeo.musicxml"
         score.write("musicxml", fp=str(annotated))
         pages, note = render(annotated, out_pdf, title_from_filename(src))
         if note:
@@ -159,10 +176,13 @@ def main():
         stats = overlay(src, omr_project, score, out_pdf, args.octave, doubtful)
         result = (f"{stats.named} nombres, {stats.unknown} notas con '?', "
                   f"{stats.squeezed} nombres achicados o encimados, {stats.marked} compases marcados")
-        if stats.discarded:
-            warnings.append(f"{stats.discarded} nota(s) que Audiveris vio pero descartó: marcadas con '?'")
-        if stats.pos_mismatch or stats.unmatched:
-            warnings.append(f"{stats.pos_mismatch + stats.unmatched} nota(s) sin emparejar con el MusicXML: marcadas con '?'")
+        if stats.from_position:
+            warnings.append(f"{stats.from_position} nota(s) que Audiveris no exportó: nombradas por su posición en la página")
+        if stats.unknown:
+            warnings.append(f"{stats.unknown} nota(s) sin nombre posible: marcadas con '?'")
+        if stats.not_exported:
+            nums = ", ".join(str(n) for n in stats.not_exported)
+            warnings.append(f"Audiveris no pudo exportar el/los compás(es) {nums}: nombres por posición, compás marcado")
 
     if omr_log:
         for msg, n in audiveris_warnings(omr_log).items():

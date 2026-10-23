@@ -28,8 +28,8 @@ El programa "lee" la partitura con reconocimiento óptico de música (OMR), igua
 | Nombres en **azul** debajo de cada pentagrama | El nombre de cada nota. |
 | Nombres en **dos alturas** alternadas | Notas muy juntas (por ejemplo, corcheas seguidas): los nombres se alternan para no pisarse. Se leen de izquierda a derecha, igual que las notas. |
 | Un nombre **más pequeño** de lo normal | No había espacio (por ejemplo, junto a un tresillo) y se redujo para que quepa. |
-| Un **"?"** | El programa vio una nota ahí, pero no pudo saber cuál es. Búscala en la partitura. |
-| Un **recuadro amarillo suave** detrás de un compás | Compás dudoso: puede faltar un nombre o haber uno equivocado. Compáralo con la partitura antes de fiarte de los nombres. |
+| Un **"?"** | El programa vio una nota ahí, pero no pudo saber cuál es. Es poco frecuente. Búscala en la partitura. |
+| Un **recuadro amarillo suave** detrás de un compás | Compás dudoso: puede faltar un nombre o haber uno equivocado (o el programa no pudo leer el compás entero). Compáralo con la partitura antes de fiarte de los nombres. |
 
 Una nota que el programa no reconoció **sigue estando en la partitura**, solo que sin nombre: la música nunca se modifica, solo se le agregan nombres. Si un nombre te parece extraño, fíate de la partitura.
 
@@ -99,15 +99,16 @@ Opciones:
 solfeo-pdf partitura.pdf --octave         # agrega el número de octava: Do4, La3...
 solfeo-pdf partitura.pdf --out-dir salida # guarda todo en la carpeta "salida"
 solfeo-pdf partitura.pdf --rerender       # redibuja la partitura en vez de escribir sobre el original
+solfeo-pdf partitura.pdf --keep           # conserva los archivos de trabajo (.mxl, .omr, logs)
 ```
 
-Junto al PDF final quedan algunos archivos de trabajo (`.mxl`, `.omr` y un `.audiveris.log`). Puedes borrarlos; solo sirven para investigar un error.
+Solo queda el PDF final: los archivos de trabajo se crean en una carpeta temporal y se borran al terminar. Con `--keep` se guardan junto al PDF, por si quieres investigar un error.
 
 ### El modo `--rerender`
 
 En vez de escribir sobre el PDF original, crea una partitura nueva con MuseScore, con los nombres como si fueran la letra de una canción. La ventaja es que el espaciado se adapta a los nombres; la desventaja es que **si el reconocimiento perdió una nota, esa nota desaparece de la música**. Por eso no es el modo por defecto.
 
-En este modo también puedes corregir a mano lo que el programa leyó: abre el `.mxl` en MuseScore, corrígelo, guárdalo como copia (por ejemplo `partitura.corrected.mxl`) y ejecuta:
+En este modo también puedes corregir a mano lo que el programa leyó: ejecútalo con `--keep` para conservar el `.mxl`, ábrelo en MuseScore, corrígelo, guárdalo como copia (por ejemplo `partitura.corrected.mxl`) y ejecuta:
 
 ```bash
 solfeo-pdf partitura.corrected.mxl
@@ -124,6 +125,7 @@ src/
   cli.py          el comando solfeo-pdf: une todos los pasos
   solfege.py      cómo se nombra cada nota (alteraciones, ligaduras, acordes)
   overlay.py      escribe los nombres sobre el PDF original usando las posiciones que guarda Audiveris
+  geometry.py     nombra una nota solo por su posición en la página (cuando Audiveris no pudo exportarla)
   inspect_omr.py  detecta compases dudosos (notas perdidas, claves sospechosas, compases incompletos)
   annotate.py     modo --rerender: agrega los nombres como letra al MusicXML
   render.py       modo --rerender: dibuja el PDF con MuseScore
@@ -136,7 +138,7 @@ Tests:
 .venv/bin/python -m unittest discover -s tests
 ```
 
-Cómo funciona por dentro: [Audiveris](https://github.com/Audiveris/audiveris) reconoce la partitura y produce dos cosas: un MusicXML (qué nota es cada una) y su proyecto `.omr` (dónde está dibujada cada cabeza de nota en la página). El programa empareja las dos, calcula el nombre con [music21](https://github.com/cuthbertLab/music21) y lo escribe en el PDF con [PyMuPDF](https://github.com/pymupdf/PyMuPDF), esquivando la tinta original para no tapar nada.
+Cómo funciona por dentro: [Audiveris](https://github.com/Audiveris/audiveris) reconoce la partitura y produce dos cosas: un MusicXML (qué nota es cada una) y su proyecto `.omr` (dónde está dibujada cada cabeza de nota en la página). El programa empareja las dos, calcula el nombre con [music21](https://github.com/cuthbertLab/music21) y lo escribe en el PDF con [PyMuPDF](https://github.com/pymupdf/PyMuPDF), esquivando la tinta original para no tapar nada. Si Audiveris detectó una nota pero no pudo incluirla en el MusicXML (le pasa en compases cuyo ritmo no logra cuadrar), el nombre se deduce de su posición en la página: línea o espacio, clave, armadura, alteraciones y ligaduras.
 
 ## Licencia
 

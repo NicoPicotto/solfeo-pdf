@@ -18,6 +18,7 @@ import pymupdf
 from music21 import chord, clef, stream
 from PIL import Image
 
+from geometry import geometric_names
 from solfege import is_tie_continuation, solfege_name
 
 FONT = "helv"
@@ -28,7 +29,7 @@ GAP_PT = 2.0          # below the staff's lowest ink (bottom line or lowest head
 MAX_DROP_LINES = 3    # how far a name may move down looking for free space
 NUDGES_PT = (0, -2.5, 2.5)  # sideways tries at each height, centre first
 COLOR = (0.08, 0.2, 0.55)
-UNKNOWN = "?"         # head we cannot name (discarded by the OMR, or unmatched)
+UNKNOWN = "?"         # head we cannot name at all
 
 
 # ---------------------------------------------------------------- .omr side
@@ -36,6 +37,18 @@ UNKNOWN = "?"         # head we cannot name (discarded by the OMR, or unmatched)
 def _sheet_entries(z):
     names = [n for n in z.namelist() if n.startswith("sheet#") and n.endswith(".xml")]
     return sorted(names, key=lambda n: int(n.split("#")[1].split("/")[0]))
+
+
+def _first_measure_numbers(z):
+    """sheet number -> offset to add to that sheet's local measure ids.
+    book.xml gives each page's measure count (delta-measure-id); ids restart
+    on every page (1, 2, ...; 0 for a pickup)."""
+    book = ET.fromstring(z.read("book.xml"))
+    offsets, running = {}, 0
+    for sheet in book.findall("sheet"):
+        offsets[int(sheet.get("number"))] = running
+        running += sum(int(p.get("delta-measure-id", 0)) for p in sheet.findall("page"))
+    return offsets
 
 
 def _overlap(a, b):
@@ -58,21 +71,23 @@ def read_omr(omr_path):
     """Returns (heads, discarded, pictures, boxes).
 
     heads: every notehead that made it into a voice, with the musical
-      coordinates needed to find it in the MusicXML: global measure index
-      (reading order == MusicXML measure order), hand (staff order in the
-      system), offset in quarters, and its chord.
+      coordinates needed to find it in the MusicXML: measure NUMBER (the
+      same one the MusicXML uses; not reading order, because Audiveris can
+      fail to export a measure and the export then skips that number), hand
+      (staff order in the system), offset in quarters, and its chord.
     discarded: heads Audiveris detected but left out of every voice (e.g. a
       triplet note it could not fit rhythmically). Candidates overlapping a
       kept head are alternatives, not lost notes, and are ignored.
     pictures: sheet number -> (width_px, height_px).
-    boxes: (measure_index, hand) -> (sheet, left, top, right, bottom,
+    boxes: (measure number, hand) -> (sheet, left, top, right, bottom,
       interline) in px: the measure's span on that hand's staff.
     """
     heads, discarded, pictures, boxes = [], [], {}, {}
-    measure_index = 0
     with zipfile.ZipFile(omr_path) as z:
+        first_number = _first_measure_numbers(z)
         for name in _sheet_entries(z):
             sheet_no = int(name.split("#")[1].split("/")[0])
+            offset_number = first_number[sheet_no]
             root = ET.fromstring(z.read(name))
             pic = root.find("picture")
             pictures[sheet_no] = (int(pic.get("width")), int(pic.get("height")))
@@ -85,19 +100,22 @@ def read_omr(omr_path):
                 for rel in system.iter("relation"):
                     if rel.find("containment") is not None:
                         contains[rel.get("source")].append(rel.get("target"))
+                # A courtesy key/time change at the end of a system is a
+                # zero-length CAUTIONARY stack that reuses the id of the real
+                # last stack, with a measure id like "8C"; it is not exported
+                # to MusicXML. Index only real stacks and skip such measures.
+                real_stacks = [st for st in system.findall("stack") if st.get("special") != "CAUTIONARY"]
                 stacks = {st.get("id"): {sl.get("id"): Fraction(sl.get("time-offset"))
                                          for sl in st.findall("slot")}
-                          for st in system.findall("stack")}
-                extents = {st.get("id"): (int(st.get("left")), int(st.get("right")))
-                           for st in system.findall("stack")}
+                          for st in real_stacks}
+                extents = {st.get("id"): (int(st.get("left")), int(st.get("right"))) for st in real_stacks}
                 # one part with two staves, or one part per hand: staff order = hand
                 parts = system.findall("part")
                 staff_ids = [s.get("id") for part in parts for s in part.findall("staff")]
-                system_measures = 0
                 for part in parts:
-                    measures = part.findall("measure")
-                    system_measures = max(system_measures, len(measures))
-                    for j, measure in enumerate(measures):
+                    measures = [m for m in part.findall("measure") if m.get("id") in stacks]
+                    for measure in measures:
+                        number = offset_number + int(measure.get("id"))
                         slots = stacks[measure.get("id")]
                         left, right = extents[measure.get("id")]
                         # the right barline of each staff gives that staff's height
@@ -106,7 +124,7 @@ def read_omr(omr_path):
                             if bar is not None and bar.get("staff") in staff_ids:
                                 b = bar.find("bounds")
                                 top = int(b.get("y"))
-                                boxes[(measure_index + j, staff_ids.index(bar.get("staff")))] = (
+                                boxes[(number, staff_ids.index(bar.get("staff")))] = (
                                     sheet_no, left, top, right, top + int(b.get("h")), interline)
                         for voice in measure.findall("voice"):
                             for entry in voice.findall("slots/entry"):
@@ -121,13 +139,12 @@ def read_omr(omr_path):
                                     # head-chords sometimes lack @staff; heads always have it
                                     sheet_heads.append(_head_dict(
                                         head, sheet_no, interline,
-                                        measure=measure_index + j,
+                                        measure=number,
                                         hand=staff_ids.index(head.get("staff")),
                                         voice=voice.get("id"),
                                         offset=slots[entry.findtext("key")] * 4,  # whole notes -> quarters
                                         chord=(sheet_no, hc.get("id")),
                                     ))
-                measure_index += system_measures
                 kept = {h["head_id"] for h in sheet_heads}
                 for el in inters.values():
                     if el.tag == "head" and el.get("id") not in kept:
@@ -141,13 +158,13 @@ def read_omr(omr_path):
 # ----------------------------------------------------------- MusicXML side
 
 def read_score_notes(score):
-    """(measure_index, hand, offset) -> [(note or chord, clef in effect)]."""
+    """(measure number, hand, offset) -> [(note or chord, clef in effect)]."""
     notes = defaultdict(list)
     for hand, part in enumerate(score.parts):
-        for i, m in enumerate(part.getElementsByClass(stream.Measure)):
+        for m in part.getElementsByClass(stream.Measure):
             for e in m.recurse().notes:
                 # resolve the clef now: the context is lost once we leave the score
-                key = (i, hand, Fraction(e.getOffsetInHierarchy(m)).limit_denominator(64))
+                key = (m.number, hand, Fraction(e.getOffsetInHierarchy(m)).limit_denominator(64))
                 notes[key].append((e, e.getContextByClass(clef.Clef)))
     return notes
 
@@ -288,13 +305,13 @@ MARK_PAD_IL = 0.6               # vertical padding around the staff, in interlin
 
 
 def mark_rects(boxes, doubtful, page_sizes, pictures):
-    """PDF rects (sheet, Rect) for doubtful (measure_index, hand) pairs.
+    """PDF rects (sheet, Rect) for doubtful (measure number, hand) pairs.
     hand None marks both staves of that measure."""
     rects = []
-    for measure_index, hand in doubtful:
+    for number, hand in doubtful:
         hands = (0, 1) if hand is None else (hand,)
         for hd in hands:
-            box = boxes.get((measure_index, hd))
+            box = boxes.get((number, hd))
             if box is None:
                 continue
             sheet, left, top, right, bottom, il = box
@@ -317,14 +334,35 @@ class OverlayStats:
     unmatched: int
     discarded: int
     marked: int
+    not_exported: list
+    from_position: int
 
 
 def overlay(pdf_in, omr_path, score, pdf_out, with_octave=False, doubtful=()):
-    """doubtful: [(measure_index, hand or None)] to highlight."""
+    """doubtful: [(measure number, hand or None)] to highlight. Measures
+    Audiveris found on the page but could not export get no names, so they
+    are highlighted too."""
     heads, discarded, pictures, boxes = read_omr(omr_path)
+    exported = {m.number for m in score.parts[0].getElementsByClass(stream.Measure)}
+    not_exported = sorted({n for n, _ in boxes} - exported)
+    doubtful = list(doubtful) + [(n, None) for n in not_exported]
     results = match(heads, read_score_notes(score), with_octave)
-    labelled = [(h, text) for h, text, _ in results if text]
-    labelled += [(h, UNKNOWN) for h in discarded]
+    # Heads the MusicXML cannot name (not exported, or disagreeing with the
+    # page) are named from the page itself: line/space, clef, key signature,
+    # accidentals, ties. Checked against the MusicXML on 4 scores: 2399/2399.
+    by_position = geometric_names(omr_path, with_octave)
+    labelled, from_position = [], 0
+    for h, text, status in results:
+        if status != "ok":
+            text = by_position.get((h["sheet"], h["head_id"]), UNKNOWN)
+            from_position += text not in (None, UNKNOWN)
+        if text:
+            labelled.append((h, text))
+    for h in discarded:
+        text = by_position.get((h["sheet"], h["head_id"]), UNKNOWN)
+        from_position += text not in (None, UNKNOWN)
+        if text:
+            labelled.append((h, text))
 
     doc = pymupdf.open(pdf_in)
     occupancy = {}
@@ -354,4 +392,6 @@ def overlay(pdf_in, omr_path, score, pdf_out, with_octave=False, doubtful=()):
         unmatched=sum(1 for *_, s in results if s == "unmatched"),
         discarded=len(discarded),
         marked=len(marks),
+        not_exported=not_exported,
+        from_position=from_position,
     )
