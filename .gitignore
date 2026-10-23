@@ -1,0 +1,9 @@
+# Copyrighted scores and everything derived from them (OMR images, MusicXML, PDFs)
+samples/
+out/
+
+CLAUDE.md
+
+.venv/
+__pycache__/
+.DS_Store

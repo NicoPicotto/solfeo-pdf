@@ -1,0 +1,4 @@
+#!/bin/bash
+# Entry point: runs the pipeline with the project's virtualenv.
+DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+exec "$DIR/.venv/bin/python" "$DIR/src/cli.py" "$@"
