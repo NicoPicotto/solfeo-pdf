@@ -6,8 +6,9 @@ Usage: python src/inspect_omr.py <score.mxl|.musicxml> [--measures N] [--octave]
 
 import argparse
 import sys
+from collections import Counter
 
-from music21 import chord, converter, expressions, note, stream
+from music21 import chord, clef, converter, expressions, note, stream
 
 from solfege import is_tie_continuation, solfege_name
 
@@ -91,42 +92,126 @@ def find_fermatas(hand_parts):
 
 
 def _content(measure):
-    """Per element: (pitch classes high→low, quarterLength). Octave-agnostic so a
-    passage repeated an octave higher still counts as the same music."""
+    """Per sounding note: (pitch classes high→low, quarterLength).
+    Octave-agnostic so a passage repeated an octave higher still counts as
+    the same music. A tie continuation is merged into the note it continues
+    ('A~A' is one A), unless it opens the bar."""
     items = []
     for e in sorted(measure.recurse().notes, key=lambda e: e.getOffsetInHierarchy(measure)):
         pcs = tuple(p.pitchClass for p in sorted(e.pitches, key=lambda p: p.ps, reverse=True))
+        notes = e.notes if isinstance(e, chord.Chord) else [e]
+        if items and items[-1][0] == pcs and all(is_tie_continuation(n) for n in notes):
+            items[-1] = (pcs, items[-1][1] + e.quarterLength)
+            continue
         items.append((pcs, e.quarterLength))
     return items
 
 
-def find_missing_notes(hand_parts, max_extra=2):
-    """Flag measure B when another measure A has the same other-hand content,
-    the same first element, and B's pitch sequence is a strict prefix of A's
-    (A has 1..max_extra more notes). Typical OMR symptom: a note was dropped
-    and the rhythm 'fixed' so the measure still adds up."""
+def _align(short, long):
+    """Indexes in `long` matching `short` element by element (pitch classes
+    only, leftmost greedy), or None if `short` is not a subsequence."""
+    idx, j = [], 0
+    for pcs, _ in short:
+        while j < len(long) and long[j][0] != pcs:
+            j += 1
+        if j == len(long):
+            return None
+        idx.append(j)
+        j += 1
+    return idx
+
+
+def find_missing_notes(hand_parts, max_extra=3):
+    """Flag measure B when another measure A looks like the same music with
+    1..max_extra more notes: B's pitches are a subsequence of A's (the lost
+    note can be anywhere, also the first one), the other hand is identical
+    and NOT silent (two silent bars are no evidence), and the first matched
+    note keeps its duration (so a whole-note A is not 'the same' as a bar
+    that starts with a dotted-quarter A), and B's version is rare: unique in
+    the piece or less frequent than A's. A real variation tends to repeat
+    (Piratas 13/29/106/122); an OMR loss is a one-off. Typical OMR symptom:
+    a note was dropped and the rhythm 'fixed' so the measure still adds up."""
     if len(hand_parts) != 2:
         return []
     measures = [list(p.getElementsByClass(stream.Measure)) for _, p in hand_parts]
     contents = [[_content(m) for m in ms] for ms in measures]
+    both = [(tuple(contents[0][i]), tuple(contents[1][i])) for i in range(len(contents[0]))]
+    frequency = Counter(both)
     warnings = []
     for h in (0, 1):
         other = 1 - h
         for b in range(len(contents[h])):
             cb = contents[h][b]
-            if not cb:
+            if not cb or not contents[other][b]:
                 continue
             for a in range(len(contents[h])):
                 ca = contents[h][a]
                 extra = len(ca) - len(cb)
-                if a == b or not 0 < extra <= max_extra:
+                if a == b or not 0 < extra <= max_extra or contents[other][a] != contents[other][b]:
                     continue
-                if contents[other][a] != contents[other][b] or ca[0] != cb[0]:
-                    continue
-                if [pcs for pcs, _ in ca[: len(cb)]] == [pcs for pcs, _ in cb]:
+                idx = _align(cb, ca)
+                rare = frequency[both[b]] == 1 or frequency[both[b]] < frequency[both[a]]
+                if idx is not None and ca[idx[0]][1] == cb[0][1] and rare:
                     warnings.append((hand_parts[h][0], measures[h][b].number, measures[h][a].number, extra))
                     break
     return warnings
+
+
+# Staff positions, in steps from the middle line (+ = down). Treble middle
+# line is B4, bass middle line is D3: 12 diatonic steps apart.
+_OTHER_CLEF_SHIFT = {"G": -12, "F": +12}
+
+
+def clef_changes(hand_parts):
+    """[(label, measure number, clef sign)] after the first clef of each hand."""
+    changes = []
+    for label, part in hand_parts:
+        seen_first = False
+        for c in part.recurse().getElementsByClass(clef.Clef):
+            if seen_first:
+                changes.append((label, c.getContextByClass(stream.Measure).number, c.sign))
+            seen_first = True
+    return changes
+
+
+def find_clef_suspects(hand_parts, far=10, inside=4, min_run=2):
+    """Runs of >= `min_run` consecutive measures whose notes all sit far from
+    the staff (>= `far` steps: 3+ ledger lines) but would all fall on the
+    staff with the other clef (treble <-> bass): the usual sign of a clef
+    change the OMR missed. A single bar, or 2 ledger lines, is normal music.
+    Limit: notes in the UPPER half of the other staff only need 2-3 ledger
+    lines, which real passages also use (UMI LH 54-55, Piratas RH 46-51), so
+    that case is not flagged."""
+    suspects = []
+    for label, part in hand_parts:
+        run = []
+        for m in part.getElementsByClass(stream.Measure):
+            if not _clef_suspect(m, far, inside):
+                if len(run) >= min_run:
+                    suspects += run
+                run = []
+                continue
+            run.append((label, m.number, _clef_suspect(m, far, inside)))
+        if len(run) >= min_run:
+            suspects += run
+    return suspects
+
+
+def _clef_suspect(m, far, inside):
+    """Clef sign if the measure looks written in the wrong clef, else None."""
+    positions, sign = [], None
+    for e in m.recurse().notes:
+        c = e.getContextByClass(clef.Clef)
+        if c is None or c.sign not in _OTHER_CLEF_SHIFT:
+            return None
+        sign = c.sign
+        positions += [c.lowestLine + 4 - p.diatonicNoteNum for p in e.pitches]
+    if not positions:
+        return None
+    shifted = [p + _OTHER_CLEF_SHIFT[sign] for p in positions]
+    if all(abs(p) >= far for p in positions) and all(abs(p) <= inside for p in shifted):
+        return sign
+    return None
 
 
 def main():
